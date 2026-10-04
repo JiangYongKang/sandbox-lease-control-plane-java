@@ -11,6 +11,7 @@ import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.ReleaseReq
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.config.LeaseProperties;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.pool.ResourcePool;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.provision.LocalSandboxProvisioner;
+import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.quota.TeamQuotaRegistry;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.store.LeaseStore;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.tests.LeaseServiceLifecycleTest.MutableClock;
 import java.util.HashSet;
@@ -42,7 +43,7 @@ class LeaseServiceConcurrencyTest {
         props.setMaxTtlSeconds(3600);
         MutableClock clock = new MutableClock();
         ResourcePool pool = new ResourcePool(props);
-        LeaseService service = new LeaseService(new LeaseStore(), pool,
+        LeaseService service = new LeaseService(new LeaseStore(), pool, new TeamQuotaRegistry(props),
                 new LocalSandboxProvisioner(), clock, props);
         return new Harness(service, pool, clock);
     }
