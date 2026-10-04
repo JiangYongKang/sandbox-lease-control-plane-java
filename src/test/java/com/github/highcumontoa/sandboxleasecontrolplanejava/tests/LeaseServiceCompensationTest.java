@@ -12,6 +12,7 @@ import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.ReleaseReq
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.RenewRequest;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.config.LeaseProperties;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.pool.ResourcePool;
+import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.quota.TeamQuotaManager;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.provision.LocalSandboxProvisioner;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.store.LeaseStore;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.tests.LeaseServiceLifecycleTest.MutableClock;
@@ -39,7 +40,7 @@ class LeaseServiceCompensationTest {
         ResourcePool pool = new ResourcePool(props);
         LeaseStore store = new LeaseStore();
         LeaseService service = new LeaseService(store, pool,
-                new LocalSandboxProvisioner(), clock, props);
+                new TeamQuotaManager(props), new LocalSandboxProvisioner(), clock, props);
         return new Harness(service, pool, clock, store);
     }
 

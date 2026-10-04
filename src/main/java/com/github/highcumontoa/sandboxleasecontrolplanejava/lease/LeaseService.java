@@ -5,16 +5,20 @@ import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.LeaseView;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.QuotaView;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.ReleaseRequest;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.RenewRequest;
+import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.TeamLeasesView;
+import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.api.TeamQuotaView;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.config.LeaseProperties;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.domain.Lease;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.pool.ResourcePool;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.provision.SandboxProvisionException;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.provision.SandboxProvisioner;
+import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.quota.TeamQuotaManager;
 import com.github.highcumontoa.sandboxleasecontrolplanejava.lease.store.LeaseStore;
 import java.time.Clock;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -37,6 +41,7 @@ public class LeaseService {
 
     private final LeaseStore store;
     private final ResourcePool pool;
+    private final TeamQuotaManager teamQuotas;
     private final SandboxProvisioner provisioner;
     private final Clock clock;
     private final LeaseProperties properties;
@@ -44,10 +49,11 @@ public class LeaseService {
     /** 公平锁：所有写操作按到达顺序串行化，结论可复现。 */
     private final ReentrantLock lock = new ReentrantLock(true);
 
-    public LeaseService(LeaseStore store, ResourcePool pool, SandboxProvisioner provisioner,
-                        Clock clock, LeaseProperties properties) {
+    public LeaseService(LeaseStore store, ResourcePool pool, TeamQuotaManager teamQuotas,
+                        SandboxProvisioner provisioner, Clock clock, LeaseProperties properties) {
         this.store = store;
         this.pool = pool;
+        this.teamQuotas = teamQuotas;
         this.provisioner = provisioner;
         this.clock = clock;
         this.properties = properties;
@@ -76,25 +82,43 @@ public class LeaseService {
                 }
                 return view;
             }
+            // 首次申请在“未占用即拒绝”（整池已满 / 团队额度已满）时也记录结论；
+            // 即使之后额度空出来，同一 requestId 也必须复现同一拒绝原因。
+            var rejected = store.findRejectedApply(requestId);
+            if (rejected.isPresent()) {
+                var r = rejected.get();
+                log.info("apply rejected idempotent hit: requestId={}, code={}", requestId, r.code());
+                throw new LeaseServiceException(r.code(), r.message());
+            }
 
             long now = clock.millis();
             String leaseId = "lease-" + UUID.randomUUID();
 
-            // 2) 先预留配额；不足则明确拒绝（此时没有任何已落库状态，无需补偿）。
-            if (!pool.tryAcquire()) {
-                log.warn("apply rejected quota exhausted: requestId={}, leaseId={}, available=0/{}",
-                        requestId, leaseId, pool.capacity());
-                throw new LeaseServiceException(ErrorCode.QUOTA_EXHAUSTED,
-                        "no available sandbox slot, capacity=" + pool.capacity());
+            // 2) 团队额度优先判定：已配置团队到达上限时给出可区分的拒绝原因
+            //    （TEAM_QUOTA_EXHAUSTED），与整池已满、参数非法区分开。未配置团队不受额外约束。
+            if (!teamQuotas.canAcquire(tenantId)) {
+                String message = "tenant " + tenantId + " reached its team quota limit "
+                        + teamQuotas.limit(tenantId);
+                rejectApply(requestId, ErrorCode.TEAM_QUOTA_EXHAUSTED, message);
             }
 
-            // 3) 配额预留成功 -> 创建 PENDING 租约并落库（不会遗留“无主”资源）。
+            // 3) 再预留整池配额；不足则明确拒绝（此时没有任何已落库状态，无需补偿）。
+            if (!pool.tryAcquire()) {
+                String message = "no available sandbox slot, capacity=" + pool.capacity();
+                log.warn("apply rejected quota exhausted: requestId={}, leaseId={}, available=0/{}",
+                        requestId, leaseId, pool.capacity());
+                rejectApply(requestId, ErrorCode.QUOTA_EXHAUSTED, message);
+            }
+
+            // 4) 两层额度都预留成功 -> 团队占用记账 + 创建 PENDING 租约落库（不存在“无主”资源）。
+            teamQuotas.acquire(tenantId);
             Lease lease = Lease.pending(leaseId, requestId, tenantId, now, now + ttl * 1000);
             store.put(lease);
-            log.info("state transition: requestId={}, leaseId={}, status null -> PENDING, expiresAt={}",
-                    requestId, leaseId, lease.getExpiresAtMillis());
+            log.info("state transition: requestId={}, leaseId={}, tenantId={}, status null -> PENDING, "
+                            + "teamLeased={}, expiresAt={}",
+                    requestId, leaseId, tenantId, teamQuotas.used(tenantId), lease.getExpiresAtMillis());
 
-            // 4) 申请底层沙箱；任何失败都归类为可区分错误，并执行补偿。
+            // 5) 申请底层沙箱；任何失败都归类为可区分错误，并执行补偿。
             String resourceId;
             try {
                 resourceId = provisioner.provision(leaseId, tenantId);
@@ -108,29 +132,42 @@ public class LeaseService {
                         "unexpected error during provision, quota has been compensated", ex);
             }
 
-            // 5) 成功：绑定资源、迁移到 ACTIVE。
+            // 6) 成功：绑定资源、迁移到 ACTIVE。
             lease.setResourceId(resourceId);
             lease.transitionTo(LeaseStatus.ACTIVE);
             LeaseView view = snapshot(lease);
             persistApplyResult(requestId, leaseId, view);
-            log.info("state transition: requestId={}, leaseId={}, status PENDING -> ACTIVE, resourceId={}, available={}",
-                    requestId, leaseId, resourceId, pool.available());
+            log.info("state transition: requestId={}, leaseId={}, tenantId={}, status PENDING -> ACTIVE, "
+                            + "resourceId={}, teamLeased={}, poolAvailable={}",
+                    requestId, leaseId, tenantId, resourceId,
+                    teamQuotas.used(tenantId), pool.available());
             return view;
         } finally {
             lock.unlock();
         }
     }
 
-    /** 失败补偿：先归还配额，再把 PENDING 迁移到 FAILED，保证余额与状态唯一确定。 */
+    /** 记录首次“未占用即拒绝”结论并抛出对应错误；此后同 requestId 只能复现该结论。 */
+    private void rejectApply(String requestId, ErrorCode code, String message) {
+        store.putRejectedApplyIfAbsent(requestId, new LeaseStore.RejectedApplyRecord(code, message));
+        log.warn("apply rejected: requestId={}, code={}, message={}, poolLeased={}/{}, teamQuotasTotal={}",
+                requestId, code, message, pool.leased(), pool.capacity(), teamQuotas.totalUsed());
+        throw new LeaseServiceException(code, message);
+    }
+
+    /** 失败补偿：先归还两层额度，再把 PENDING 迁移到 FAILED，保证余额与状态唯一确定。 */
     private void compensateFailedProvision(String requestId, Lease lease, Exception cause) {
         pool.release();
+        teamQuotas.release(lease.getTenantId());
         lease.setFailedReason(cause.getClass().getSimpleName());
         lease.setEndedAtMillis(clock.millis());
         lease.transitionTo(LeaseStatus.FAILED);
         LeaseView failedView = snapshot(lease);
         persistApplyResult(requestId, lease.getLeaseId(), failedView);
-        log.warn("compensation done: requestId={}, leaseId={}, status PENDING -> FAILED, reason={}, available={}",
-                requestId, lease.getLeaseId(), cause.getClass().getSimpleName(), pool.available());
+        log.warn("compensation done: requestId={}, leaseId={}, tenantId={}, status PENDING -> FAILED, "
+                        + "reason={}, teamLeased={}, poolAvailable={}",
+                requestId, lease.getLeaseId(), lease.getTenantId(), cause.getClass().getSimpleName(),
+                teamQuotas.used(lease.getTenantId()), pool.available());
     }
 
     private void persistApplyResult(String requestId, String leaseId, LeaseView view) {
@@ -155,11 +192,15 @@ public class LeaseService {
 
             Lease lease = requireLease(leaseId);
 
-            // requestId 若曾用于其它租约的申请/操作，属于冲突而非静默复用。
+            // requestId 若曾用于其它租约的申请/操作（含被拒申请），属于冲突而非静默复用。
             var applyRecord = store.findApplyRecord(requestId);
             if (applyRecord.isPresent() && !applyRecord.get().leaseId().equals(leaseId)) {
                 throw new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
                         "requestId " + requestId + " already used by another lease");
+            }
+            if (store.findRejectedApply(requestId).isPresent()) {
+                throw new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+                        "requestId " + requestId + " already used by a rejected application");
             }
 
             LeaseStatus before = lease.getStatus();
@@ -237,14 +278,17 @@ public class LeaseService {
                         leaseId, resourceId, ex);
             }
             pool.release();
+            teamQuotas.release(lease.getTenantId());
             lease.setEndedAtMillis(clock.millis());
             lease.transitionTo(LeaseStatus.RELEASED);
             LeaseView view = snapshot(lease);
             if (requestId != null) {
                 view = store.putOpRecordIfAbsent(requestId, view);
             }
-            log.info("state transition: requestId={}, leaseId={}, status RELEASING -> RELEASED, available={}",
-                    requestId, leaseId, pool.available());
+            log.info("state transition: requestId={}, leaseId={}, tenantId={}, "
+                            + "status RELEASING -> RELEASED, teamLeased={}, poolAvailable={}",
+                    requestId, leaseId, lease.getTenantId(),
+                    teamQuotas.used(lease.getTenantId()), pool.available());
             return view;
         } finally {
             lock.unlock();
@@ -273,6 +317,69 @@ public class LeaseService {
         }
     }
 
+    /** 团队额度使用快照（上限 / 占用 / 剩余 + 整池快照）。先做该团队的惰性到期回收。 */
+    public TeamQuotaView teamQuota(String tenantId) {
+        if (isBlank(tenantId)) {
+            throw new LeaseServiceException(ErrorCode.INVALID_REQUEST, "tenantId is required");
+        }
+        lock.lock();
+        try {
+            expireTeamLeasesIfNeeded(tenantId, "team-quota");
+            return teamQuotas.snapshot(tenantId, pool);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 团队当前非终态租约清单；清单数即团队占用，与 teamQuota 口径一致。 */
+    public TeamLeasesView teamLeases(String tenantId) {
+        if (isBlank(tenantId)) {
+            throw new LeaseServiceException(ErrorCode.INVALID_REQUEST, "tenantId is required");
+        }
+        lock.lock();
+        try {
+            expireTeamLeasesIfNeeded(tenantId, "team-leases");
+            List<LeaseView> leases = store.findAll().stream()
+                    .filter(l -> tenantId.equals(l.getTenantId()))
+                    .filter(l -> !l.getStatus().isTerminal())
+                    .map(LeaseService::snapshot)
+                    .collect(Collectors.toList());
+            // 占用记账以 TeamQuotaManager 为准（租约清单在同一把锁内必然与之相等）。
+            int leased = teamQuotas.used(tenantId);
+            log.info("team leases queried: tenantId={}, leased={}, listed={}, poolLeased={}/{}",
+                    tenantId, leased, leases.size(), pool.leased(), pool.capacity());
+            return new TeamLeasesView(tenantId, leased, leases);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 在线调整团队额度，立即对后续申请生效；null 移除配置回到整池共享。
+     * 只改配置不碰占用：调到低于当前占用也不抢占已开出租约。
+     */
+    public TeamQuotaView configureTeamQuota(String tenantId, Integer limit) {
+        if (isBlank(tenantId)) {
+            throw new LeaseServiceException(ErrorCode.INVALID_REQUEST, "tenantId is required");
+        }
+        if (limit != null && limit < 0) {
+            throw new LeaseServiceException(ErrorCode.INVALID_REQUEST,
+                    "team quota limit must be positive or zero (or null to remove)");
+        }
+        lock.lock();
+        try {
+            teamQuotas.configure(tenantId, limit);
+            if (limit != null && limit > pool.capacity()) {
+                log.warn("team quota limit {} for tenant {} exceeds pool capacity {}; "
+                                + "effective throughput is still bounded by the pool",
+                        limit, tenantId, pool.capacity());
+            }
+            return teamQuotas.snapshot(tenantId, pool);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** 扫描并回收已到期租约，返回本次回收数量。与主动释放共用同一把锁。 */
     public int reapExpired() {
         lock.lock();
@@ -292,11 +399,14 @@ public class LeaseService {
                             lease.getLeaseId(), ex);
                 }
                 pool.release();
+                teamQuotas.release(lease.getTenantId());
                 lease.setEndedAtMillis(clock.millis());
                 lease.transitionTo(LeaseStatus.EXPIRED);
                 reaped++;
-                log.info("state transition (auto-reap): leaseId={}, status {} -> EXPIRED, available={}",
-                        lease.getLeaseId(), before, pool.available());
+                log.info("state transition (auto-reap): leaseId={}, tenantId={}, status {} -> EXPIRED, "
+                                + "teamLeased={}, poolAvailable={}",
+                        lease.getLeaseId(), lease.getTenantId(), before,
+                        teamQuotas.used(lease.getTenantId()), pool.available());
             }
             if (reaped > 0) {
                 log.info("auto-reap finished: reaped={}, available={}", reaped, pool.available());
@@ -320,10 +430,25 @@ public class LeaseService {
                         lease.getLeaseId(), ex);
             }
             pool.release();
+            teamQuotas.release(lease.getTenantId());
             lease.setEndedAtMillis(clock.millis());
             lease.transitionTo(LeaseStatus.EXPIRED);
-            log.info("state transition (lazy-expiry in {}): requestId={}, leaseId={}, status {} -> EXPIRED, available={}",
-                    scene, lease.getRequestId(), lease.getLeaseId(), before, pool.available());
+            log.info("state transition (lazy-expiry in {}): requestId={}, leaseId={}, tenantId={}, "
+                            + "status {} -> EXPIRED, teamLeased={}, poolAvailable={}",
+                    scene, lease.getRequestId(), lease.getLeaseId(), lease.getTenantId(), before,
+                    teamQuotas.used(lease.getTenantId()), pool.available());
+        }
+    }
+
+    /**
+     * 针对单个团队做惰性到期回收：团队额度/租约查询前调用，使团队占用与整池口径一致。
+     * 终结逻辑仍只走 {@link #expireIfNeeded} 一处，不会重复归还。
+     */
+    private void expireTeamLeasesIfNeeded(String tenantId, String scene) {
+        for (Lease lease : store.findAll()) {
+            if (tenantId.equals(lease.getTenantId()) && !lease.getStatus().isTerminal()) {
+                expireIfNeeded(lease, scene);
+            }
         }
     }
 
