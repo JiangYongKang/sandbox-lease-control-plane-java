@@ -116,7 +116,7 @@ curl -s -X DELETE localhost:8080/api/leases/teams/team-a/quota
 | ---- | ---- | ---- |
 | `INVALID_REQUEST` | 400 | 缺少 requestId/tenantId、ttl 非法、报文格式错 |
 | `LEASE_NOT_FOUND` | 404 | 租约不存在 |
-| `IDEMPOTENCY_KEY_CONFLICT` | 409 | requestId 已被另一个租约使用 |
+| `IDEMPOTENCY_KEY_CONFLICT` | 409 | requestId 已被另一个租约使用；或首次结论是被拒的 requestId 被复用于续约/释放 |
 | `LEASE_EXPIRED` | 409 | 对已到期租约续约 |
 | `LEASE_NOT_ACTIVE` | 409 | 非 ACTIVE 租约续约、释放 FAILED 租约等 |
 | `QUOTA_EXHAUSTED` | 503 | 资源池已满 |
@@ -131,6 +131,22 @@ curl -s -X DELETE localhost:8080/api/leases/teams/team-a/quota
   整池已满）的结论同样落库**：同一 `requestId` 重复提交，不管首次是成功还是被拒，
   都拿到一致结论——不会因为中间额度空出来了，第二次提交就悄悄变成申请成功。
 - 续约/释放：按各自 `requestId` 记录首次操作结论，重复操作返回同一结论。
+
+### 5.1 requestId 在申请 / 续约 / 释放之间的复用规则
+
+一个 `requestId` 的**首次结论**（无论成功、失败还是被拒）唯一确定它之后在所有
+操作入口的行为，结论必须与首次结果对得上，任何路径都不会报 `INTERNAL_ERROR`：
+
+| 首次结论 | 复用于申请 | 复用于续约 / 释放 |
+| ---- | ---- | ---- |
+| 被拒（`TEAM_QUOTA_EXCEEDED` / `QUOTA_EXHAUSTED`，未落任何租约） | 复现首次拒绝（429 / 503） | `IDEMPOTENCY_KEY_CONFLICT`（409） |
+| 失败（`PROVISION_FAILED`，已补偿落 `FAILED`） | 复现同一失败结论（502） | 用于本租约：按状态机判定（如 `LEASE_NOT_ACTIVE`）；用于其它租约：409 冲突 |
+| 成功（`ACTIVE`） | 返回首次成功结论 | 用于本租约：按状态机正常处理；用于其它租约：409 冲突 |
+
+- 被拒的 `requestId` 复用于续约/释放时，返回的是**可区分的业务冲突（409）**，
+  而不是内部错误（500）；也不会被当成一次全新操作悄悄放行。
+- 这类复用判定只读幂等结论，**不触碰团队额度与整池占用**：首次被拒不会因为
+  后续复用而多占额度，对账不变量“各团队占用之和 == 整池 leased”始终成立。
 - 所有写操作在 `LeaseService` 的同一把公平锁内串行；配合资源池 CAS，
   保证并发申请不超卖、重复释放不重复归还、回收/释放竞争结果唯一。
 - 到期有两个入口（定时扫描 `LeaseReaper` 与各操作中的惰性判定），
@@ -158,7 +174,7 @@ curl -s -X DELETE localhost:8080/api/leases/teams/team-a/quota  # 清除上限�
 ## 7. 本地验证（无需联网 / 外部服务）
 
 ```bash
-# 全量测试（24 个用例）
+# 全量测试（28 个用例）
 mvn test
 
 # 只跑某一类场景
@@ -167,6 +183,7 @@ mvn test -Dtest=LeaseServiceCompensationTest     # 失败补偿 / 超时回收 /
 mvn test -Dtest=LeaseServiceConcurrencyTest      # 并发抢占 / 提交竞争 / 释放-回收竞争
 mvn test -Dtest=LeaseServiceGuardTest            # 查询可复现 / 状态守卫 / 标识冲突
 mvn test -Dtest=LeaseServiceTeamQuotaTest        # 团队额度准入 / 跨团队并发 / 拒绝幂等 / 额度归还 / 在线调整
+mvn test -Dtest=LeaseServiceRequestIdReuseTest   # requestId 先被拒后被复用于申请/续约/释放：冲突而非 500、不占额度
 mvn test -Dtest=LeaseControllerIntegrationTest   # HTTP 状态码与错误码端到端
 mvn test -Dtest=TeamQuotaControllerIntegrationTest  # 团队额度 HTTP 端到端（429 / 在线调整 / 对账）
 
@@ -184,6 +201,7 @@ team quota acquire: teamId=team-a, used 0 -> 1, limit=2
 state transition: requestId=req-1, leaseId=..., status null -> PENDING, expiresAt=...
 state transition: requestId=req-1, leaseId=..., status PENDING -> ACTIVE, resourceId=sb-...
 apply rejected team quota exceeded: requestId=tq-a2, tenantId=team-a, used=1, limit=1
+renew rejected requestId reuse: requestId=ru-rej, leaseId=..., firstRejectedWith=TEAM_QUOTA_EXCEEDED
 team quota limit updated: teamId=team-a, limit 2 -> 3, used=2
 compensation done: requestId=fail-req-1, status PENDING -> FAILED, reason=SimulatedDownstreamException, available=1
 state transition (auto-reap): leaseId=..., status ACTIVE -> EXPIRED, available=...

@@ -187,12 +187,8 @@ public class LeaseService {
 
             Lease lease = requireLease(leaseId);
 
-            // requestId 若曾用于其它租约的申请/操作，属于冲突而非静默复用。
-            var applyRecord = store.findApplyRecord(requestId);
-            if (applyRecord.isPresent() && !applyRecord.get().leaseId().equals(leaseId)) {
-                throw new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
-                        "requestId " + requestId + " already used by another lease");
-            }
+            // requestId 若已有首次申请结论（被拒/成功/失败），复用到续约必须能对得上首次结论。
+            ensureOpRequestIdConsistent(requestId, leaseId, "renew");
 
             LeaseStatus before = lease.getStatus();
             expireIfNeeded(lease, "renew");
@@ -234,6 +230,12 @@ public class LeaseService {
             }
 
             Lease lease = requireLease(leaseId);
+
+            // 与续约同一套规则：requestId 若已有首次申请结论，复用到释放必须能对得上首次结论，
+            // 不能被当成一次全新操作放行。
+            if (requestId != null) {
+                ensureOpRequestIdConsistent(requestId, leaseId, "release");
+            }
 
             // 自动回收与主动释放竞争：谁先拿到锁谁终结租约，另一方看到终态后返回同一结论。
             expireIfNeeded(lease, "release");
@@ -440,6 +442,38 @@ public class LeaseService {
         return store.find(leaseId)
                 .orElseThrow(() -> new LeaseServiceException(ErrorCode.LEASE_NOT_FOUND,
                         "lease " + leaseId + " not found"));
+    }
+
+    /**
+     * 续约/释放场景下的 requestId 复用检查，与申请幂等结论对齐：
+     * <ul>
+     *   <li>首次结论是被拒（团队额度超限/整池已满，未落任何租约）：复用到续约/释放属于
+     *       业务冲突，稳定返回 {@link ErrorCode#IDEMPOTENCY_KEY_CONFLICT}，
+     *       不得因记录里没有 leaseId 而抛空指针变成内部错误；</li>
+     *   <li>首次结论已落在其它租约上（成功或补偿后失败）：同样冲突，不得静默复用；</li>
+     *   <li>首次结论落在本租约上：视为同一租约的后续操作，放行由状态机判定。</li>
+     * </ul>
+     * 无论哪种分支都不触碰团队额度与整池占用。
+     */
+    private void ensureOpRequestIdConsistent(String requestId, String leaseId, String scene) {
+        var applyRecord = store.findApplyRecord(requestId);
+        if (applyRecord.isEmpty()) {
+            return;
+        }
+        var record = applyRecord.get();
+        if (record.rejectedWith() != null) {
+            log.warn("{} rejected requestId reuse: requestId={}, leaseId={}, firstRejectedWith={}",
+                    scene, requestId, leaseId, record.rejectedWith());
+            throw new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+                    "requestId " + requestId + " was already rejected as " + record.rejectedWith()
+                            + ", cannot be reused for " + scene);
+        }
+        if (!record.leaseId().equals(leaseId)) {
+            log.warn("{} conflicting requestId reuse: requestId={}, leaseId={}, ownerLeaseId={}",
+                    scene, requestId, leaseId, record.leaseId());
+            throw new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+                    "requestId " + requestId + " already used by another lease");
+        }
     }
 
     private long normalizeTtl(long ttlSeconds) {
