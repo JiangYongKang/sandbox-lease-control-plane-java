@@ -93,6 +93,11 @@ public class LeaseService {
                 return view;
             }
 
+            // requestId 若已被续约/释放操作占用，也不能再当成一次全新申请放行。
+            if (store.findOpRecord(requestId).isPresent()) {
+                throw conflictByAnotherOperation(requestId, "apply");
+            }
+
             long now = clock.millis();
             String leaseId = "lease-" + UUID.randomUUID();
 
@@ -178,6 +183,21 @@ public class LeaseService {
 
         lock.lock();
         try {
+            // 先判申请归属：requestId 首次结论是第一位的。首次申请即被拒（leaseId 为 null）
+            // 或归属另一个租约时，都是确定性的标识冲突——绝不能因 null 比较退化成内部错误，
+            // 也不能先被操作幂等记录“劫走”而返回不相干租约的结论。
+            var applyRecord = store.findApplyRecord(requestId);
+            if (applyRecord.isPresent()) {
+                var record = applyRecord.get();
+                if (record.rejectedWith() != null) {
+                    throw conflictRejectedApply(requestId, record.rejectedWith(), "renew");
+                }
+                if (!leaseId.equals(record.leaseId())) {
+                    throw new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+                            "requestId " + requestId + " already used by another lease");
+                }
+            }
+
             var opExisting = store.findOpRecord(requestId);
             if (opExisting.isPresent()) {
                 log.info("renew idempotent hit: requestId={}, leaseId={}, status={}",
@@ -186,13 +206,6 @@ public class LeaseService {
             }
 
             Lease lease = requireLease(leaseId);
-
-            // requestId 若曾用于其它租约的申请/操作，属于冲突而非静默复用。
-            var applyRecord = store.findApplyRecord(requestId);
-            if (applyRecord.isPresent() && !applyRecord.get().leaseId().equals(leaseId)) {
-                throw new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
-                        "requestId " + requestId + " already used by another lease");
-            }
 
             LeaseStatus before = lease.getStatus();
             expireIfNeeded(lease, "renew");
@@ -224,6 +237,23 @@ public class LeaseService {
 
         lock.lock();
         try {
+            // 先判申请归属：requestId 若首次用于申请，其结论与归属租约是第一位的——
+            // 首次申请被拒必须复现冲突、属于他租约必须冲突，不能先被操作幂等记录“劫走”，
+            // 否则释放另一个在用租约会静默拿到不相干租约的结论。
+            if (requestId != null) {
+                var applyRecord = store.findApplyRecord(requestId);
+                if (applyRecord.isPresent()) {
+                    var record = applyRecord.get();
+                    if (record.rejectedWith() != null) {
+                        throw conflictRejectedApply(requestId, record.rejectedWith(), "release");
+                    }
+                    if (!leaseId.equals(record.leaseId())) {
+                        throw new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+                                "requestId " + requestId + " already used by another lease");
+                    }
+                }
+            }
+
             if (requestId != null) {
                 var opExisting = store.findOpRecord(requestId);
                 if (opExisting.isPresent()) {
@@ -440,6 +470,25 @@ public class LeaseService {
         return store.find(leaseId)
                 .orElseThrow(() -> new LeaseServiceException(ErrorCode.LEASE_NOT_FOUND,
                         "lease " + leaseId + " not found"));
+    }
+
+    /**
+     * 首次申请即被拒（团队额度超限/整池已满）的 requestId 被续约/释放复用时，
+     * 返回确定性的标识冲突（409），并在文案中带上首次拒绝码，保证调用方既能识别
+     * “这是标识复用冲突”，也能追溯“这个标识第一次的结论是什么”。绝不抛内部错误。
+     */
+    private static LeaseServiceException conflictRejectedApply(String requestId, ErrorCode firstRejection,
+                                                               String scene) {
+        return new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+                "requestId " + requestId + " was first rejected as " + firstRejection
+                        + " and cannot be reused for " + scene);
+    }
+
+    /** requestId 已被续约/释放操作占用，再拿去申请属于标识冲突。 */
+    private static LeaseServiceException conflictByAnotherOperation(String requestId, String scene) {
+        return new LeaseServiceException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+                "requestId " + requestId + " is already bound to another renew/release operation"
+                        + " and cannot be reused for " + scene);
     }
 
     private long normalizeTtl(long ttlSeconds) {

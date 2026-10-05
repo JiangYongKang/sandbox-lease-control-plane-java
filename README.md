@@ -116,7 +116,7 @@ curl -s -X DELETE localhost:8080/api/leases/teams/team-a/quota
 | ---- | ---- | ---- |
 | `INVALID_REQUEST` | 400 | 缺少 requestId/tenantId、ttl 非法、报文格式错 |
 | `LEASE_NOT_FOUND` | 404 | 租约不存在 |
-| `IDEMPOTENCY_KEY_CONFLICT` | 409 | requestId 已被另一个租约使用 |
+| `IDEMPOTENCY_KEY_CONFLICT` | 409 | requestId 已被另一个租约使用；首次申请被拒/失败的标识被复用于续约或释放；续约/释放标识反向复用于申请 |
 | `LEASE_EXPIRED` | 409 | 对已到期租约续约 |
 | `LEASE_NOT_ACTIVE` | 409 | 非 ACTIVE 租约续约、释放 FAILED 租约等 |
 | `QUOTA_EXHAUSTED` | 503 | 资源池已满 |
@@ -135,6 +135,34 @@ curl -s -X DELETE localhost:8080/api/leases/teams/team-a/quota
   保证并发申请不超卖、重复释放不重复归还、回收/释放竞争结果唯一。
 - 到期有两个入口（定时扫描 `LeaseReaper` 与各操作中的惰性判定），
   但终结逻辑唯一且受锁保护。
+
+### 5.1 请求标识在申请 / 续约 / 释放之间的复用与冲突规则
+
+一个 `requestId` 第一次使用后即“钉住”自己的首次结论与归属租约，之后在
+申请、续约、释放三个操作之间复用时结论确定、可区分，且**任何复用路径都不会
+退化成 500 内部错误，也不会多占额度或改动整池占用**：
+
+| 首次结论 | 再用于申请 | 再用于续约/释放（同一租约） | 再用于续约/释放（其它租约） |
+| ---- | ---- | ---- | ---- |
+| 团队额度被拒 `TEAM_QUOTA_EXCEEDED`(429) | 复现 429 | `IDEMPOTENCY_KEY_CONFLICT`(409)，文案带首次拒绝码 | 409 |
+| 整池已满被拒 `QUOTA_EXHAUSTED`(503) | 复现 503（即使后来池位空出） | 409，文案带首次拒绝码 | 409 |
+| 供应失败 `PROVISION_FAILED`(502)，已补偿 | 复现 502 | 409（该租约为 FAILED 终态） | 409 |
+| 成功（租约 ACTIVE/已终结） | 返回同一租约视图 | 允许：续约顺延到期；释放按当前终态结论返回 | 409 |
+
+补充约定：
+
+- **先判首次申请结论，再判操作幂等**：续约/释放入口先核对该标识是否属于本次
+  目标租约、首次是否被拒，再查续约/释放的操作幂等记录；避免一个标识先在别的
+  租约上留下操作结论后，把不相干租约的结论“劫”给本次操作。
+- **反向复用同样拦截**：一个已被续约/释放占用的 `requestId` 不能再拿去发起
+  申请，同样返回 409。
+- 续约与释放的操作幂等各用自己的 `requestId`（实践中为每次操作分配独立标识）；
+- 被拒标识的冲突路径是纯判定，不执行任何 acquire/release，因此首次被拒不会
+  因为后续复用而多占额度，“各团队占用之和 == 整池 leased”始终成立。
+
+> 历史坑位：首次申请被拒的记录没有 `leaseId`，续约路径曾直接对其调用
+> `leaseId.equals(...)` 触发 NPE，把一个确定性的标识冲突透传成了 500。
+> 现由 `LeaseService#conflictRejectedApply` 统一归类为 409。
 
 ## 6. 配置（src/main/resources/application.properties）
 
@@ -158,7 +186,7 @@ curl -s -X DELETE localhost:8080/api/leases/teams/team-a/quota  # 清除上限�
 ## 7. 本地验证（无需联网 / 外部服务）
 
 ```bash
-# 全量测试（24 个用例）
+# 全量测试（29 个用例）
 mvn test
 
 # 只跑某一类场景
@@ -167,11 +195,35 @@ mvn test -Dtest=LeaseServiceCompensationTest     # 失败补偿 / 超时回收 /
 mvn test -Dtest=LeaseServiceConcurrencyTest      # 并发抢占 / 提交竞争 / 释放-回收竞争
 mvn test -Dtest=LeaseServiceGuardTest            # 查询可复现 / 状态守卫 / 标识冲突
 mvn test -Dtest=LeaseServiceTeamQuotaTest        # 团队额度准入 / 跨团队并发 / 拒绝幂等 / 额度归还 / 在线调整
-mvn test -Dtest=LeaseControllerIntegrationTest   # HTTP 状态码与错误码端到端
+mvn test -Dtest=RequestIdReuseConflictTest       # 被拒标识跨申请/续约/释放复用：409/复现首次结论/不多占额度/对账
+mvn test -Dtest=LeaseControllerIntegrationTest   # HTTP 状态码与错误码端到端（含被拒标识复用续约 409，不再 500）
 mvn test -Dtest=TeamQuotaControllerIntegrationTest  # 团队额度 HTTP 端到端（429 / 在线调整 / 对账）
 
 # 启动后手工验证
 mvn spring-boot:run
+```
+
+手工复现“请求标识先被团队额度拒、再被复用续约”的场景：
+
+```bash
+# 1) team-demo 上限设为 1
+curl -s -X PUT localhost:8080/api/leases/teams/team-demo/quota \
+  -H 'Content-Type: application/json' -d '{"limit":1}'
+# 2) 占满 team-demo 的额度
+curl -s -X POST localhost:8080/api/leases -H 'Content-Type: application/json' \
+  -d '{"requestId":"demo-1","tenantId":"team-demo","ttlSeconds":120}'
+# 3) 同团队再申请 -> 首次结论 429 TEAM_QUOTA_EXCEEDED
+curl -i -X POST localhost:8080/api/leases -H 'Content-Type: application/json' \
+  -d '{"requestId":"demo-rej","tenantId":"team-demo","ttlSeconds":120}'
+# 4) 另一个团队申请一个正在使用的环境，记下 leaseId
+curl -s -X POST localhost:8080/api/leases -H 'Content-Type: application/json' \
+  -d '{"requestId":"demo-2","tenantId":"team-other","ttlSeconds":120}'
+# 5) 拿 demo-rej 去续约那个环境 -> 409 IDEMPOTENCY_KEY_CONFLICT（修复前为 500）
+curl -i -X POST localhost:8080/api/leases/<leaseId>/renew \
+  -H 'Content-Type: application/json' -d '{"requestId":"demo-rej","ttlSeconds":120}'
+# 6) 拿 demo-rej 去释放同样 409；再拿 demo-rej 重新申请，仍复现 429（额度空出也一样）
+curl -i -X POST localhost:8080/api/leases/<leaseId>/release \
+  -H 'Content-Type: application/json' -d '{"requestId":"demo-rej"}'
 ```
 
 并发与超时测试通过注入可控 `Clock`（`MutableClock`）驱动时间，结果确定可复现。
